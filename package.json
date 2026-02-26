@@ -1,5 +1,5 @@
 {
-  "name": "@xterm/xterm",
+  "name": "@simpfun/simpterm",
   "description": "Full xterm terminal, in your browser",
   "version": "6.0.0",
   "main": "lib/xterm.js",

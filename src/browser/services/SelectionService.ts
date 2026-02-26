@@ -641,18 +641,35 @@ export class SelectionService extends Disposable implements ISelectionService {
     }
 
     this._longPressTimer = window.setTimeout(() => {
-      console.log('Long press triggered at', coords);
       this._longPressTimer = undefined;
       if (this._selectWordAt(coords, true)) {
         this._activeSelectionMode = SelectionMode.WORD;
         this.refresh(true);
         this._fireEventIfSelectionChanged();
+        
+        // Sync to textarea for mobile context menu
+        this._syncToTextArea();
+
         // Vibrate if supported
         if ('vibrate' in navigator) {
           navigator.vibrate(50);
         }
       }
     }, 500);
+  }
+
+  private _syncToTextArea(): void {
+    const textarea = this._coreBrowserService.mainDocument.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement;
+    if (textarea && this.hasSelection) {
+      textarea.value = this.selectionText;
+      textarea.focus();
+      textarea.select();
+      // Try to maintain focus for system menu
+      setTimeout(() => {
+        textarea.focus();
+        textarea.select();
+      }, 10);
+    }
   }
 
   private _handleTouchMove(event: TouchEvent): void {
@@ -1180,7 +1197,8 @@ export class SelectionService extends Disposable implements ISelectionService {
             this._model.selectionEnd = coords;
           }
           this.refresh(true);
-          this.updateHandles(); // Add this line to update handle positions in real-time
+          this.updateHandles();
+          this._syncToTextArea();
         }
       }, { passive: false });
     }

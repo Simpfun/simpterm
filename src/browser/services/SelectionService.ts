@@ -111,6 +111,16 @@ export class SelectionService extends Disposable implements ISelectionService {
   private _oldSelectionStart: [number, number] | undefined = undefined;
   private _oldSelectionEnd: [number, number] | undefined = undefined;
 
+  private _touchStartListener: EventListener;
+  private _touchMoveListener: EventListener;
+  private _touchEndListener: EventListener;
+  private _longPressTimer: number | undefined;
+  private _lastTouchCoords: [number, number] | undefined;
+
+  private _selectionHandles: HTMLElement[] = [];
+  private _handleStartListener: EventListener | undefined;
+  private _handleEndListener: EventListener | undefined;
+
   private readonly _onLinuxMouseSelection = this._register(new Emitter<string>());
   public readonly onLinuxMouseSelection = this._onLinuxMouseSelection.event;
   private readonly _onRedrawRequest = this._register(new Emitter<ISelectionRedrawRequestEvent>());
@@ -136,6 +146,9 @@ export class SelectionService extends Disposable implements ISelectionService {
     // Init listeners
     this._mouseMoveListener = event => this._handleMouseMove(event as MouseEvent);
     this._mouseUpListener = event => this._handleMouseUp(event as MouseEvent);
+    this._touchStartListener = event => this._handleTouchStart(event as TouchEvent);
+    this._touchMoveListener = event => this._handleTouchMove(event as TouchEvent);
+    this._touchEndListener = event => this._handleTouchEnd(event as TouchEvent);
     this._coreService.onUserInput(() => {
       if (this.hasSelection) {
         this.clearSelection();
@@ -180,6 +193,19 @@ export class SelectionService extends Disposable implements ISelectionService {
    */
   public enable(): void {
     this._enabled = true;
+    this._addTouchListeners();
+  }
+
+  private _addTouchListeners(): void {
+    this._screenElement.addEventListener('touchstart', this._touchStartListener, { passive: false });
+    this._screenElement.addEventListener('touchmove', this._touchMoveListener, { passive: false });
+    this._screenElement.addEventListener('touchend', this._touchEndListener, { passive: false });
+  }
+
+  private _removeTouchListeners(): void {
+    this._screenElement.removeEventListener('touchstart', this._touchStartListener);
+    this._screenElement.removeEventListener('touchmove', this._touchMoveListener);
+    this._screenElement.removeEventListener('touchend', this._touchEndListener);
   }
 
   public get selectionStart(): [number, number] | undefined { return this._model.finalSelectionStart; }
@@ -447,6 +473,9 @@ export class SelectionService extends Disposable implements ISelectionService {
    * @param event The mousedown event.
    */
   public handleMouseDown(event: MouseEvent): void {
+    if (this._longPressTimer) {
+      return;
+    }
     this._mouseDownTimeStamp = event.timeStamp;
     // If we have selection, we want the context menu on right click even if the
     // terminal is in mouse mode.
@@ -592,6 +621,76 @@ export class SelectionService extends Disposable implements ISelectionService {
     }
   }
 
+  private _handleTouchStart(event: TouchEvent): void {
+    console.log('touchstart', event.touches.length);
+    if (event.touches.length !== 1) {
+      return;
+    }
+
+    const touch = event.touches[0];
+    const coords = this._getMouseBufferCoords(touch as any as MouseEvent);
+    if (!coords) {
+      return;
+    }
+
+    this._lastTouchCoords = coords;
+    this._mouseDownTimeStamp = event.timeStamp;
+
+    if (this._longPressTimer) {
+      window.clearTimeout(this._longPressTimer);
+    }
+
+    this._longPressTimer = window.setTimeout(() => {
+      console.log('Long press triggered at', coords);
+      this._longPressTimer = undefined;
+      if (this._selectWordAt(coords, true)) {
+        this._activeSelectionMode = SelectionMode.WORD;
+        this.refresh(true);
+        this._fireEventIfSelectionChanged();
+        // Vibrate if supported
+        if ('vibrate' in navigator) {
+          navigator.vibrate(50);
+        }
+      }
+    }, 500);
+  }
+
+  private _handleTouchMove(event: TouchEvent): void {
+    if (event.touches.length !== 1) {
+      return;
+    }
+
+    if (this._longPressTimer) {
+      const touch = event.touches[0];
+      const coords = this._getMouseBufferCoords(touch as any as MouseEvent);
+      if (coords && this._lastTouchCoords) {
+        const dx = Math.abs(coords[0] - this._lastTouchCoords[0]);
+        const dy = Math.abs(coords[1] - this._lastTouchCoords[1]);
+        if (dx > 1 || dy > 0) {
+          window.clearTimeout(this._longPressTimer);
+          this._longPressTimer = undefined;
+        }
+      }
+    }
+
+    if (this.hasSelection) {
+      event.preventDefault();
+      const touch = event.touches[0];
+      this._handleMouseMove(touch as any as MouseEvent);
+    }
+  }
+
+  private _handleTouchEnd(event: TouchEvent): void {
+    if (this._longPressTimer) {
+      window.clearTimeout(this._longPressTimer);
+      this._longPressTimer = undefined;
+    }
+
+    if (this.hasSelection) {
+      this._handleMouseUp(event as any as MouseEvent);
+    }
+  }
+
   /**
    * Returns whether the selection manager should operate in column select mode
    * @param event the mouse or keyboard event
@@ -709,6 +808,10 @@ export class SelectionService extends Disposable implements ISelectionService {
    * @param event The mouseup event.
    */
   private _handleMouseUp(event: MouseEvent): void {
+    if (this._longPressTimer) {
+      window.clearTimeout(this._longPressTimer);
+      this._longPressTimer = undefined;
+    }
     const timeElapsed = event.timeStamp - this._mouseDownTimeStamp;
 
     this._removeMouseDownListeners();
@@ -762,6 +865,7 @@ export class SelectionService extends Disposable implements ISelectionService {
     this._oldSelectionEnd = end;
     this._oldHasSelection = hasSelection;
     this._onSelectionChange.fire();
+    this.updateHandles();
   }
 
   private _handleBufferActivate(e: {activeBuffer: IBuffer, inactiveBuffer: IBuffer}): void {
@@ -975,7 +1079,7 @@ export class SelectionService extends Disposable implements ISelectionService {
    * @param coords The coordinates to get the word at.
    * @param allowWhitespaceOnlySelection If whitespace should be selected
    */
-  protected _selectWordAt(coords: [number, number], allowWhitespaceOnlySelection: boolean): void {
+  protected _selectWordAt(coords: [number, number], allowWhitespaceOnlySelection: boolean): boolean {
     const wordPosition = this._getWordAt(coords, allowWhitespaceOnlySelection);
     if (wordPosition) {
       // Adjust negative start value
@@ -985,7 +1089,9 @@ export class SelectionService extends Disposable implements ISelectionService {
       }
       this._model.selectionStart = [wordPosition.start, coords[1]];
       this._model.selectionStartLength = wordPosition.length;
+      return true;
     }
+    return false;
   }
 
   /**
@@ -1014,6 +1120,86 @@ export class SelectionService extends Disposable implements ISelectionService {
 
       this._model.selectionEnd = [this._model.areSelectionValuesReversed() ? wordPosition.start : wordPosition.start + wordPosition.length, endRow];
     }
+  }
+
+  public updateHandles(): void {
+    if (!this.hasSelection) {
+      this._selectionHandles.forEach(h => h.style.display = 'none');
+      return;
+    }
+
+    const start = this._model.finalSelectionStart!;
+    const end = this._model.finalSelectionEnd!;
+
+    if (this._selectionHandles.length === 0) {
+      this._createHandles();
+    }
+
+    this._positionHandle(this._selectionHandles[0], start[0], start[1], true);
+    this._positionHandle(this._selectionHandles[1], end[0], end[1], false);
+  }
+
+  private _createHandles(): void {
+    for (let i = 0; i < 2; i++) {
+      const handle = this._coreBrowserService.mainDocument.createElement('div');
+      handle.classList.add('xterm-selection-handle');
+      handle.style.position = 'absolute';
+      handle.style.width = '12px';
+      handle.style.height = '12px';
+      handle.style.borderRadius = '50%';
+      handle.style.backgroundColor = '#4080ff';
+      handle.style.zIndex = '20';
+      handle.style.cursor = 'pointer';
+      // Increase touch area
+      const touchArea = this._coreBrowserService.mainDocument.createElement('div');
+      touchArea.style.position = 'absolute';
+      touchArea.style.top = '-15px';
+      touchArea.style.left = '-15px';
+      touchArea.style.right = '-15px';
+      touchArea.style.bottom = '-15px';
+      handle.appendChild(touchArea);
+
+      this._screenElement.appendChild(handle);
+      this._selectionHandles.push(handle);
+
+      handle.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }, { passive: false });
+
+      handle.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.touches.length !== 1) return;
+        const touch = e.touches[0];
+        const coords = this._getMouseBufferCoords(touch as any as MouseEvent);
+        if (coords) {
+          if (i === 0) {
+            this._model.selectionStart = coords;
+          } else {
+            this._model.selectionEnd = coords;
+          }
+          this.refresh(true);
+          this.updateHandles(); // Add this line to update handle positions in real-time
+        }
+      }, { passive: false });
+    }
+  }
+
+  private _positionHandle(handle: HTMLElement, col: number, row: number, isStart: boolean): void {
+    const cellWidth = this._renderService.dimensions.css.cell.width;
+    const cellHeight = this._renderService.dimensions.css.cell.height;
+    const viewportRow = row - this._bufferService.buffer.ydisp;
+
+    // Only show handle if it's within the viewport
+    if (viewportRow < 0 || viewportRow >= this._bufferService.rows) {
+      handle.style.display = 'none';
+      return;
+    }
+
+    handle.style.display = 'block';
+    handle.style.left = `${col * cellWidth - 6}px`;
+    handle.style.top = `${(viewportRow + (isStart ? 0 : 1)) * cellHeight - 6}px`;
   }
 
   /**
